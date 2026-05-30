@@ -21,47 +21,42 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ap-southeast-2
 
-      - name: Create artifact
-        run: zip -r app.zip . -x "*.git*"
-
-      - name: Upload to S3
+      - name: Create and upload artifact
         run: |
+          zip -r app.zip . -x "*.git*"
           aws s3 cp app.zip s3://${{ secrets.S3_BUCKET }}/app-${{ github.sha }}.zip
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ap-southeast-2
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 54.252.242.192 >> ~/.ssh/known_hosts
 
       - name: Deploy to EC2
         run: |
-          aws ssm send-command \
-            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-            --document-name "AWS-RunShellScript" \
-            --parameters '{"commands":["aws s3 cp s3://${{ secrets.S3_BUCKET }}/app-${{ github.sha }}.zip /tmp/","cd /tmp && unzip -o app-${{ github.sha }}.zip","sudo cp /tmp/index.html /var/www/html/index.html","sudo systemctl restart httpd"]}' \
-            --region ap-southeast-2
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ec2-user@54.252.242.192 "sudo cp /var/www/html/index.html /var/www/html/index.html.bak"
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no index.html ec2-user@54.252.242.192:/tmp/index.html
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ec2-user@54.252.242.192 "sudo cp /tmp/index.html /var/www/html/index.html && sudo systemctl restart httpd"
 
   rollback:
     needs: deploy
     if: failure()
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ap-southeast-2
-
-      - name: Auto Rollback
+      - name: Setup SSH
         run: |
-          PREV=$(aws s3 ls s3://${{ secrets.S3_BUCKET }}/ | sort | tail -2 | head -1 | awk '{print $4}')
-          aws ssm send-command \
-            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "{\"commands\":[\"aws s3 cp s3://${{ secrets.S3_BUCKET }}/$PREV /tmp/\",\"cd /tmp && unzip -o $PREV\",\"sudo cp /tmp/index.html /var/www/html/index.html\",\"sudo systemctl restart httpd\"]}" \
-            --region ap-southeast-2
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 54.252.242.192 >> ~/.ssh/known_hosts
+
+      - name: Rollback to previous version
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ec2-user@54.252.242.192 "sudo cp /var/www/html/index.html.bak /var/www/html/index.html && sudo systemctl restart httpd"
